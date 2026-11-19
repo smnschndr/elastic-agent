@@ -6,7 +6,9 @@ package limits
 
 import (
 	"fmt"
+	"math"
 	"runtime"
+	"strconv"
 	"sync"
 
 	"github.com/elastic/elastic-agent/internal/pkg/config"
@@ -33,6 +35,54 @@ type LimitsConfig struct {
 	// Translates into the GOMAXPROCS runtime parameter for each Go process started by the agent and the agent itself.
 	// By default is set to `0` which means using all available CPUs.
 	GoMaxProcs int `yaml:"go_max_procs" config:"go_max_procs" json:"go_max_procs"`
+
+	// CPU is the requested CPU limit for the agent and its components together, as a percentage of the host CPU capacity.
+	// 0 or no value means off. It is excluded from JSON because components must not receive it.
+	CPU CPULimit `config:"cpu" json:"-"`
+}
+
+// CPULimit is a cap on CPU use, as a percentage of the host CPU capacity.
+// The zero value means the cap is off. A config value of 0 also means off.
+type CPULimit struct {
+	percent int
+}
+
+// Unpack implements ucfg.Unpacker.
+// It takes the raw value because go-ucfg would silently cut 50.5 to 50 when it unpacks into an int.
+func (l *CPULimit) Unpack(v any) error {
+	var percent float64
+	switch x := v.(type) {
+	case int64:
+		percent = float64(x)
+	case uint64:
+		percent = float64(x)
+	case float64:
+		percent = x
+	case string:
+		// Parsing a string as a float could round a fraction such as "100.000000000000001" to 100.
+		n, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid CPU limit %#v: must be a whole number from 0 to 100", v)
+		}
+		percent = float64(n)
+	default:
+		return fmt.Errorf("invalid CPU limit %#v: must be a whole number from 0 to 100", v)
+	}
+	if percent != math.Trunc(percent) || percent < 0 || percent > 100 {
+		return fmt.Errorf("invalid CPU limit %#v: must be a whole number from 0 to 100", v)
+	}
+	l.percent = int(percent)
+	return nil
+}
+
+// Enabled reports whether the cap is on.
+func (l CPULimit) Enabled() bool {
+	return l.percent > 0
+}
+
+// Percent returns the cap as a percentage from 1 to 100, or 0 when the cap is off.
+func (l CPULimit) Percent() int {
+	return l.percent
 }
 
 type LimitsOnChangeCallback func(new, old LimitsConfig)
@@ -72,11 +122,14 @@ func (f *limits) set(newLimits *LimitsConfig) {
 		for _, cb := range f.callbacks {
 			cb(f.cfg, oldLimits)
 		}
+	} else {
+		// The other fields did not change, so only the CPU value needs a write.
+		f.cfg.CPU = newLimits.CPU
 	}
 }
 
 // AddLimitsOnChangeCallback takes a callback function that will be called with the new and old values
-// of limits whenever they change.
+// of limits when the go_max_procs value changes.
 // It also takes a string ID which is used in `RemoveLimitsOnChangeCallback` to de-register the callback.
 func AddLimitsOnChangeCallback(cb LimitsOnChangeCallback, id string) {
 	current.mu.Lock()
