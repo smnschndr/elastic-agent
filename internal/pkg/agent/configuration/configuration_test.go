@@ -266,3 +266,13 @@ func writeFleetConfig(t *testing.T, fleetConfig string) {
 	err = store.Save(strings.NewReader(fleetConfig))
 	require.NoError(t, err)
 }
+
+func TestNewFromConfig_CPULimitPreview(t *testing.T) {
+	c, err := NewFromConfig(config.MustNewConfigFrom(""))
+	require.NoError(t, err)
+	assert.False(t, c.Settings.Internal.Limits.CPU.PreviewEnabled, "the CPU cap preview is off by default")
+
+	c, err = NewFromConfig(config.MustNewConfigFrom("agent.internal.limits.cpu.enabled: true"))
+	require.NoError(t, err)
+	assert.True(t, c.Settings.Internal.Limits.CPU.PreviewEnabled)
+}

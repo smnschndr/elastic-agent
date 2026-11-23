@@ -782,3 +782,9 @@ func TestCleanupOldBuildLogs(t *testing.T) {
 		assert.Contains(t, warnings[0].Message, "Error cleaning build logs")
 	})
 }
+
+func TestNewCPULimitController(t *testing.T) {
+	log, _ := loggertest.New("")
+	assert.Nil(t, newCPULimitController(log, configuration.InternalCPULimitConfig{}), "no controller when the preview is off")
+	assert.NotNil(t, newCPULimitController(log, configuration.InternalCPULimitConfig{PreviewEnabled: true}))
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 	"github.com/elastic/go-sysinfo/types"
 
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/transpiler"
@@ -624,6 +625,13 @@ func TestDiagnosticState(t *testing.T) {
 				RetryUntil:      &now,
 			},
 		},
+		CPULimit: &cpulimit.Snapshot{
+			State:         cpulimit.StateDegraded,
+			Configured:    cpuLimitPercent(t, 50),
+			EffectiveCPUs: 4,
+			ActiveQuota:   cpulimit.Quota{Kind: cpulimit.QuotaSet, CPUs: 2},
+			Err:           errors.New("quota mismatch"),
+		},
 	}
 
 	expected := fmt.Sprintf(`
@@ -653,6 +661,13 @@ upgrade_details:
     scheduled_at: %s
     download_rate: 123.56
     retry_until: %s
+cpu_limit:
+  state: degraded
+  configured_percent: 50
+  effective_cpus: 4
+  active_quota: set
+  active_quota_cpus: 2
+  error: quota mismatch
 `, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 
 	coord := &Coordinator{

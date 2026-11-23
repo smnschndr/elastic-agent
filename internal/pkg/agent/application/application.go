@@ -21,6 +21,7 @@ import (
 	"github.com/elastic/beats/v7/pkg/logp"
 
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/dispatcher"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
@@ -277,7 +278,8 @@ func New(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create otel manager: %w", err)
 	}
-	coord := coordinator.New(log, cfg, logLevel, agentInfo, specs, reexec, upgrader, runtime, configMgr, varsManager, caps, monitor, isManaged, otelManager, actionAcker, initialUpgradeDetails, hostInfo, compModifiers...)
+	cpuLimit := newCPULimitController(log, cfg.Settings.Internal.Limits.CPU)
+	coord := coordinator.New(log, cfg, logLevel, agentInfo, specs, reexec, upgrader, runtime, configMgr, varsManager, caps, monitor, isManaged, otelManager, actionAcker, initialUpgradeDetails, hostInfo, cpuLimit, compModifiers...)
 	if managed != nil {
 		// the coordinator requires the config manager as well as in managed-mode the config manager requires the
 		// coordinator, so it must be set here once the coordinator is created
@@ -300,6 +302,15 @@ func New(
 	}
 
 	return coord, configMgr, varsManager, nil
+}
+
+// newCPULimitController returns the CPU limit controller, or nil when the CPU cap preview is off. The setting is read
+// only here at startup, so a change needs an Agent restart.
+func newCPULimitController(log *logger.Logger, cfg configuration.InternalCPULimitConfig) coordinator.CPULimitController {
+	if !cfg.PreviewEnabled {
+		return nil
+	}
+	return cpulimit.NewController(log.Named("cpu_limit"), cpulimit.NewUnsupportedBackend())
 }
 
 // normalizeAgentInstalls normalizes agent installs and TTL markers on startup.

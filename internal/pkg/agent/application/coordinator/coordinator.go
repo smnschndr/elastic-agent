@@ -37,6 +37,7 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/enroll"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/paths"
@@ -182,6 +183,26 @@ type HostInfoWatcher interface {
 	Get(ctx context.Context) (hostinfo.Info, error)
 }
 
+// CPULimitController keeps the CPU cap of the agent and its components in line with the accepted configuration.
+// The Coordinator gets no controller when the CPU cap preview is off.
+type CPULimitController interface {
+	// Run applies the requested CPU limit until ctx is done.
+	Run(ctx context.Context) error
+
+	// Set records the CPU limit of an accepted configuration.
+	Set(l limits.CPULimit)
+
+	// Snapshot returns the current state of the CPU cap.
+	Snapshot() cpulimit.Snapshot
+
+	// Updates returns a channel that receives the newest state of the CPU cap.
+	Updates() <-chan cpulimit.Snapshot
+
+	// Ready returns a channel that is closed when components may start: the cap is off, verified or unsupported.
+	// It stays closed after that.
+	Ready() <-chan struct{}
+}
+
 // OTelManager provides an interface to run components and plain otel configurations in an otel collector.
 type OTelManager interface {
 	Runner
@@ -307,6 +328,15 @@ type pendingManagerUpdate struct {
 // allow the STOPPED state to propagate through the coordinator.
 var transitionTimeout = runtime.ProcessStopTimeout + 3*time.Second
 
+// cpuLimitShutdownTimeout bounds the wait for the CPU limit controller at shutdown, because an operating system call
+// can ignore its context and never return.
+var cpuLimitShutdownTimeout = 10 * time.Second
+
+// cpuLimitStartTimeout is how long components may wait for the CPU cap before the agent reports FAILED.
+// The Upgrade Watcher rolls back an upgrade when the agent is FAILED for 30 seconds after an 11 minute grace
+// period, so a failed CPU cap must be reported well inside that period.
+var cpuLimitStartTimeout = 5 * time.Minute
+
 // pendingRuntimeTransitions tracks deferred manager updates for components
 // that are moving between the process and OTel runtimes. There is at most
 // one pending update per direction.
@@ -350,6 +380,18 @@ type Coordinator struct {
 
 	// hostInfo is the agent's shared host information. The Coordinator runs it.
 	hostInfo HostInfoWatcher
+
+	// cpuLimit enforces the CPU cap. The Coordinator runs it. It is nil when the CPU cap preview is off, and then
+	// nothing about the CPU cap is reported.
+	cpuLimit CPULimitController
+	// cpuLimitIgnoredLogged is true after the warning that a requested CPU cap is ignored was logged.
+	cpuLimitIgnoredLogged bool
+	// cpuLimitHeld is true while components wait for the CPU cap. Only exempt components run then.
+	cpuLimitHeld bool
+	// cpuLimitStartTimer runs from the first hold until the release or the timeout. It is nil when not running.
+	cpuLimitStartTimer *time.Timer
+	// cpuLimitStartTimedOut is true when the components were held for longer than cpuLimitStartTimeout.
+	cpuLimitStartTimedOut bool
 
 	initialCfg *configuration.Configuration
 	currentCfg *configuration.Configuration
@@ -524,6 +566,11 @@ type managerChans struct {
 	otelManagerError           <-chan error
 
 	upgradeMarkerUpdate <-chan upgrade.UpdateMarker
+
+	cpuLimitUpdate <-chan cpulimit.Snapshot
+	// cpuLimitReady is the Ready channel of the CPU limit controller. It is nil when there is no controller or
+	// after the components were released, so the gate never closes again.
+	cpuLimitReady <-chan struct{}
 }
 
 // diffCheck is a container used by checkAndLogUpdate()
@@ -567,6 +614,7 @@ func New(
 	fleetAcker acker.Acker,
 	initialUpgradeDetails *details.Details,
 	hostInfo HostInfoWatcher,
+	cpuLimit CPULimitController,
 	modifiers ...component.ComponentsModifier,
 ) *Coordinator {
 	var fleetState cproto.State
@@ -576,6 +624,11 @@ func New(
 		fleetState = agentclient.Stopped
 		fleetMessage = "Not enrolled into Fleet"
 	}
+	var cpuLimitState *cpulimit.Snapshot
+	if cpuLimit != nil {
+		snapshot := cpuLimit.Snapshot()
+		cpuLimitState = &snapshot
+	}
 	state := State{
 		State:          agentclient.Starting,
 		Message:        "Starting",
@@ -584,6 +637,7 @@ func New(
 		LogLevel:       logLevel,
 		Tags:           agentInfo.GetTags(),
 		UpgradeDetails: initialUpgradeDetails,
+		CPULimit:       cpuLimitState,
 	}
 	c := &Coordinator{
 		logger:     logger,
@@ -591,6 +645,7 @@ func New(
 		currentCfg: cfg,
 		agentInfo:  agentInfo,
 		hostInfo:   hostInfo,
+		cpuLimit:   cpuLimit,
 		isManaged:  isManaged,
 		specs:      specs,
 		reexecMgr:  reexecMgr,
@@ -670,6 +725,10 @@ func New(
 	}
 	if upgradeMgr != nil && upgradeMgr.MarkerWatcher() != nil {
 		c.managerChans.upgradeMarkerUpdate = upgradeMgr.MarkerWatcher().Watch()
+	}
+	if cpuLimit != nil {
+		c.managerChans.cpuLimitUpdate = cpuLimit.Updates()
+		c.managerChans.cpuLimitReady = cpuLimit.Ready()
 	}
 	return c
 }
@@ -1497,6 +1556,15 @@ func (c *Coordinator) DiagnosticHooks() diagnostics.Hooks {
 					Timestamp  string                           `yaml:"timestamp"`
 					Components map[string]*StateCollectorStatus `yaml:"components,omitempty"`
 				}
+				type StateCPULimit struct {
+					State             cpulimit.State `yaml:"state"`
+					ConfiguredPercent int            `yaml:"configured_percent"`
+					EffectiveCPUs     float64        `yaml:"effective_cpus"`
+					ActiveQuota       string         `yaml:"active_quota"`
+					ActiveQuotaCPUs   float64        `yaml:"active_quota_cpus,omitempty"`
+					Err               string         `yaml:"error,omitempty"`
+					Reason            string         `yaml:"reason,omitempty"`
+				}
 				type StateHookOutput struct {
 					State          agentclient.State      `yaml:"state"`
 					Message        string                 `yaml:"message"`
@@ -1506,6 +1574,7 @@ func (c *Coordinator) DiagnosticHooks() diagnostics.Hooks {
 					Components     []StateComponentOutput `yaml:"components"`
 					Collector      *StateCollectorStatus  `yaml:"collector,omitempty"`
 					UpgradeDetails *details.Details       `yaml:"upgrade_details,omitempty"`
+					CPULimit       *StateCPULimit         `yaml:"cpu_limit,omitempty"`
 				}
 
 				var toCollectorStatus func(status *status.AggregateStatus) *StateCollectorStatus
@@ -1540,6 +1609,23 @@ func (c *Coordinator) DiagnosticHooks() diagnostics.Hooks {
 				if s.Collector != nil {
 					collectorStatus = toCollectorStatus(s.Collector)
 				}
+				// The section is left out when the CPU cap preview is off.
+				var cpuLimit *StateCPULimit
+				if s.CPULimit != nil {
+					cpuLimit = &StateCPULimit{
+						State:             s.CPULimit.State,
+						ConfiguredPercent: s.CPULimit.Configured.Percent(),
+						EffectiveCPUs:     s.CPULimit.EffectiveCPUs,
+						ActiveQuota:       s.CPULimit.ActiveQuota.Kind.Name(),
+						Reason:            s.CPULimit.Reason,
+					}
+					if s.CPULimit.ActiveQuota.Kind == cpulimit.QuotaSet {
+						cpuLimit.ActiveQuotaCPUs = s.CPULimit.ActiveQuota.CPUs
+					}
+					if s.CPULimit.Err != nil {
+						cpuLimit.Err = s.CPULimit.Err.Error()
+					}
+				}
 				output := StateHookOutput{
 					State:          s.State,
 					Message:        s.Message,
@@ -1549,6 +1635,7 @@ func (c *Coordinator) DiagnosticHooks() diagnostics.Hooks {
 					Components:     compStates,
 					Collector:      collectorStatus,
 					UpgradeDetails: s.UpgradeDetails,
+					CPULimit:       cpuLimit,
 				}
 				o, err := yaml.Marshal(output)
 				if err != nil {
@@ -1682,6 +1769,18 @@ func (c *Coordinator) runner(ctx context.Context) error {
 		close(hostInfoDone)
 	}
 
+	cpuLimitDone := make(chan struct{})
+	if c.cpuLimit != nil {
+		go func() {
+			defer close(cpuLimitDone)
+			if err := c.cpuLimit.Run(ctx); err != nil && ctx.Err() == nil {
+				c.logger.Errorf("Failed enforcing the CPU limit: %v", err)
+			}
+		}()
+	} else {
+		close(cpuLimitDone)
+	}
+
 	upgradeMarkerWatcherErrCh := make(chan error, 1)
 	if c.upgradeMgr != nil && c.upgradeMgr.MarkerWatcher() != nil {
 		err := c.upgradeMgr.MarkerWatcher().Run(ctx)
@@ -1698,7 +1797,15 @@ func (c *Coordinator) runner(ctx context.Context) error {
 	for ctx.Err() == nil {
 		c.runLoopIteration(ctx)
 	}
+	c.stopCPULimitStartTimer()
 	<-hostInfoDone
+	cpuLimitWait := time.NewTimer(cpuLimitShutdownTimeout)
+	select {
+	case <-cpuLimitDone:
+	case <-cpuLimitWait.C:
+		c.logger.Warnf("The CPU limit controller did not stop within %s, continuing the shutdown", cpuLimitShutdownTimeout)
+	}
+	cpuLimitWait.Stop()
 
 	// If we got fatal errors from any of the managers, return them.
 	// Otherwise, just return the context's closing error.
@@ -1713,6 +1820,11 @@ func (c *Coordinator) runner(ctx context.Context) error {
 // runLoopIteration runs one iteration of the Coorinator's internal run
 // loop in a standalone helper function to enable testing.
 func (c *Coordinator) runLoopIteration(ctx context.Context) {
+	var cpuLimitStartTimeoutC <-chan time.Time
+	if c.cpuLimitStartTimer != nil {
+		cpuLimitStartTimeoutC = c.cpuLimitStartTimer.C
+	}
+
 	select {
 	case <-ctx.Done():
 		return
@@ -1792,6 +1904,17 @@ func (c *Coordinator) runLoopIteration(ctx context.Context) {
 
 	case collectorStatus := <-c.managerChans.otelManagerCollectorUpdate:
 		c.state.Collector = collectorStatus
+		c.stateNeedsRefresh = true
+
+	case cpuLimitState := <-c.managerChans.cpuLimitUpdate:
+		c.setCPULimitState(cpuLimitState)
+
+	case <-c.managerChans.cpuLimitReady:
+		c.releaseCPULimitHold(ctx)
+
+	case <-cpuLimitStartTimeoutC:
+		c.cpuLimitStartTimer = nil
+		c.cpuLimitStartTimedOut = true
 		c.stateNeedsRefresh = true
 
 	case ll := <-c.logLevelCh:
@@ -1903,9 +2026,26 @@ func (c *Coordinator) processConfig(ctx context.Context, cfg *config.Config) (er
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+	// limits.Apply in generateAST already validated the same configuration, so this error is only a guard
+	// and does not happen in normal use.
+	agentLimits, err := limits.Parse(cfg)
+	if err != nil {
+		return fmt.Errorf("invalid limits configuration: %w", err)
+	}
 	// Only Settings is read later; holding UCfg would retain a full copy of the policy tree.
 	currentCfg.UCfg = nil
 	c.currentCfg = currentCfg
+
+	// The configuration is in use from here. A later component model error is reported but does not revert it.
+	// The CPU limit was validated by limits.Apply in generateAST, so a rejected CPU limit never reaches Set.
+	// With the CPU cap preview off there is no controller: the CPU limit is validated but not enforced.
+	if c.cpuLimit != nil {
+		c.cpuLimit.Set(agentLimits.CPU)
+	} else if agentLimits.CPU.Enabled() && !c.cpuLimitIgnoredLogged {
+		c.cpuLimitIgnoredLogged = true
+		c.logger.Warn("The agent.limits.cpu setting is ignored because the CPU cap preview is off. " +
+			"Set agent.internal.limits.cpu.enabled to true and restart the Agent to use it.")
+	}
 
 	// Standalone mode has no dedicated notification channel unlike managed mode,
 	// so the log level is read from the policy config on each reload.
@@ -2175,6 +2315,16 @@ func (c *Coordinator) refreshComponentModel(ctx context.Context) (err error) {
 	}
 	c.state.PolicyConfiguredActionTypes = policyConfiguredActionTypes(c.componentModel)
 	c.state.PolicyApplied = true
+	if c.holdForCPULimit() {
+		// The full model stays in c.componentModel and is sent when the components are released.
+		var exempt []component.Component
+		for _, comp := range c.componentModel {
+			if cpuLimitExempt(comp) {
+				exempt = append(exempt, comp)
+			}
+		}
+		model.Components = exempt
+	}
 
 	c.logger.Info("Updating running component model")
 	if c.logger.IsDebug() {
@@ -2183,6 +2333,67 @@ func (c *Coordinator) refreshComponentModel(ctx context.Context) (err error) {
 	}
 	c.updateManagersWithConfig(model)
 	return nil
+}
+
+// cpuLimitExempt reports whether comp may start before the CPU cap is in place. Fleet Server must run so the agents
+// that use it stay connected. Service components such as Endpoint run outside the CPU cap.
+func cpuLimitExempt(comp component.Component) bool {
+	if comp.InputType == fleetServer {
+		return true
+	}
+	// The runtime uses the command when a spec has both, so only a spec without a command runs as a service.
+	return comp.InputSpec != nil && comp.InputSpec.Spec.Command == nil && comp.InputSpec.Spec.Service != nil
+}
+
+// holdForCPULimit reports whether components must wait for the CPU cap. The first hold starts the start timer.
+// Must be called on the main Coordinator goroutine.
+func (c *Coordinator) holdForCPULimit() bool {
+	if c.managerChans.cpuLimitReady == nil {
+		return false
+	}
+	select {
+	case <-c.managerChans.cpuLimitReady:
+		// Ready closed before the run loop saw it, for example when Set turned the cap off in this policy change.
+		c.openCPULimitGate()
+		return false
+	default:
+	}
+	if !c.cpuLimitHeld {
+		c.cpuLimitHeld = true
+		c.cpuLimitStartTimer = time.NewTimer(cpuLimitStartTimeout)
+		c.stateNeedsRefresh = true
+	}
+	return true
+}
+
+// releaseCPULimitHold opens the CPU limit gate and sends the full component model if components were held.
+// Must be called on the main Coordinator goroutine.
+func (c *Coordinator) releaseCPULimitHold(ctx context.Context) {
+	held := c.cpuLimitHeld
+	c.openCPULimitGate()
+	if !held {
+		return
+	}
+	if err := c.refreshComponentModel(ctx); err != nil {
+		c.logger.Errorf("error refreshing component model after the CPU limit was ready: %v", err)
+	}
+}
+
+// openCPULimitGate ends the hold for good, so later component models are sent in full.
+// Must be called on the main Coordinator goroutine.
+func (c *Coordinator) openCPULimitGate() {
+	c.managerChans.cpuLimitReady = nil
+	c.cpuLimitHeld = false
+	c.cpuLimitStartTimedOut = false
+	c.stopCPULimitStartTimer()
+	c.stateNeedsRefresh = true
+}
+
+func (c *Coordinator) stopCPULimitStartTimer() {
+	if c.cpuLimitStartTimer != nil {
+		c.cpuLimitStartTimer.Stop()
+		c.cpuLimitStartTimer = nil
+	}
 }
 
 // updateManagersWithConfig updates runtime managers with the component model.
