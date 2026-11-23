@@ -27,6 +27,35 @@ type AgentECSMeta struct {
 	Complete      bool   `json:"complete"`
 	Unprivileged  bool   `json:"unprivileged"`
 	FIPS          bool   `json:"fips"`
+	// Limits is the state of the agent resource limits. It is set by the check-in only when the CPU limit preview is
+	// on. It is absent in all other cases, for example in the enrollment metadata, in the agent-info diagnostics and in
+	// metadata from agents that do not support it.
+	Limits *LimitsECSMeta `json:"limits,omitempty" yaml:",omitempty"`
+}
+
+// LimitsECSMeta is the state of the agent resource limits.
+type LimitsECSMeta struct {
+	CPU CPULimitECSMeta `json:"cpu"`
+}
+
+// CPULimitECSMeta is the state of the agent CPU limit.
+// Fleet Server merges new metadata into its stored copy, so a key that is no longer sent stays stored. All keys are always
+// sent.
+type CPULimitECSMeta struct {
+	// State is the CPU limit state, for example "applied" or "disabled".
+	State string `json:"state"`
+	// ConfiguredPercent is the configured limit in percent. It is 0 when the limit is off.
+	ConfiguredPercent int `json:"configured_percent"`
+	// EffectiveCPUs is the requested number of CPUs after the floor is applied. It is 0 when the cap is off or the
+	// CPU count was not read.
+	EffectiveCPUs float64 `json:"effective_cpus"`
+	// ActiveQuota tells what is known about the quota set in the operating system: "unknown", "none" or "set".
+	ActiveQuota string `json:"active_quota"`
+	// ActiveQuotaCPUs is the active quota in CPUs. It is 0 unless ActiveQuota is "set".
+	ActiveQuotaCPUs float64 `json:"active_quota_cpus"`
+	// Reason tells why the limit is not supported on this host. It is empty in other states. It is a short fixed
+	// text with no host details, because Fleet Server logs and stores it.
+	Reason string `json:"reason"`
 }
 
 // SystemECSMeta is a collection of operating system metadata in ECS compliant object form.
