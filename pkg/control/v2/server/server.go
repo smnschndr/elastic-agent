@@ -30,6 +30,7 @@ import (
 
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/configuration"
 	"github.com/elastic/elastic-agent/internal/pkg/diagnostics"
@@ -475,7 +476,28 @@ func stateToProto(state *coordinator.State, agentInfo info.Agent) (*cproto.State
 		Components:     components,
 		UpgradeDetails: upgradeDetails,
 		Collector:      collectorToProto(state.Collector),
+		CpuLimit:       cpuLimitToProto(state.CPULimit),
 	}, nil
+}
+
+func cpuLimitToProto(s *cpulimit.Snapshot) *cproto.CPULimit {
+	if s == nil || s.State == "" {
+		return nil
+	}
+	r := &cproto.CPULimit{
+		State:             string(s.State),
+		ConfiguredPercent: uint32(s.Configured.Percent()), //nolint:gosec // G115: Percent is from 0 to 100
+		EffectiveCpus:     s.EffectiveCPUs,
+		ActiveQuota:       s.ActiveQuota.Kind.Name(),
+		Reason:            s.Reason,
+	}
+	if s.ActiveQuota.Kind == cpulimit.QuotaSet {
+		r.ActiveQuotaCpus = s.ActiveQuota.CPUs
+	}
+	if s.Err != nil {
+		r.Error = s.Err.Error()
+	}
+	return r
 }
 
 func collectorToProto(s *status.AggregateStatus) *cproto.CollectorComponent {

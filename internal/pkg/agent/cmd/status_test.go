@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/list"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/elastic/elastic-agent/pkg/control/v2/client"
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
@@ -279,4 +281,170 @@ func TestHumanDurationUntil(t *testing.T) {
 			require.Regexp(t, regexp.MustCompile(test.expectedDurationRegexp), actualTimeStr)
 		})
 	}
+}
+
+func TestListCPULimit(t *testing.T) {
+	cases := map[string]struct {
+		cpuLimit       *client.CPULimitState
+		all            bool
+		expectedOutput string
+	}{
+		"not_reported": {
+			cpuLimit:       nil,
+			all:            true,
+			expectedOutput: "",
+		},
+		"human_disabled": {
+			cpuLimit:       &client.CPULimitState{State: "disabled", ActiveQuota: "none"},
+			expectedOutput: "",
+		},
+		"human_empty_state": {
+			cpuLimit:       &client.CPULimitState{},
+			expectedOutput: "",
+		},
+		"human_unknown_state": {
+			cpuLimit: &client.CPULimitState{State: "throttled", ConfiguredPercent: 50, EffectiveCPUs: 2, ActiveQuota: "none"},
+			expectedOutput: `── cpu_limit
+   ├─ state: throttled
+   ├─ configured: 50%
+   ├─ effective_cpus: 2.00
+   └─ active_quota: none`,
+		},
+		"human_applied": {
+			cpuLimit:       &client.CPULimitState{State: "applied", ConfiguredPercent: 50, EffectiveCPUs: 2, ActiveQuota: "set", ActiveQuotaCPUs: 2},
+			expectedOutput: "",
+		},
+		"human_pending": {
+			cpuLimit: &client.CPULimitState{State: "pending", ConfiguredPercent: 50},
+			expectedOutput: `── cpu_limit
+   ├─ state: pending
+   ├─ configured: 50%
+   └─ active_quota: unknown`,
+		},
+		"human_unsupported": {
+			cpuLimit: &client.CPULimitState{State: "unsupported", ConfiguredPercent: 25, ActiveQuota: "unknown", Reason: "not supported here"},
+			expectedOutput: `── cpu_limit
+   ├─ state: unsupported
+   ├─ configured: 25%
+   ├─ active_quota: unknown
+   └─ reason: not supported here`,
+		},
+		"human_degraded": {
+			cpuLimit: &client.CPULimitState{
+				State:             "degraded",
+				ConfiguredPercent: 50,
+				EffectiveCPUs:     2,
+				ActiveQuota:       "set",
+				ActiveQuotaCPUs:   3.25,
+				Error:             "set failed",
+			},
+			expectedOutput: `── cpu_limit
+   ├─ state: degraded
+   ├─ configured: 50%
+   ├─ effective_cpus: 2.00
+   ├─ active_quota: 3.25 CPUs
+   └─ error: set failed`,
+		},
+	}
+
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := list.NewWriter()
+			l.SetStyle(list.StyleConnectedLight)
+
+			listCPULimit(l, test.cpuLimit, test.all)
+			require.Equal(t, test.expectedOutput, l.Render())
+		})
+	}
+}
+
+func TestStatusOutputCPULimit(t *testing.T) {
+	state := &client.AgentState{
+		Info:         client.AgentStateInfo{ID: "agent-id", Version: "9.7.0", Commit: "abc"},
+		State:        client.Healthy,
+		Message:      "Running",
+		FleetState:   client.Healthy,
+		FleetMessage: "Connected",
+		CPULimit:     &client.CPULimitState{State: "disabled", ActiveQuota: "none"},
+	}
+
+	t.Run("human", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, humanOutput(&b, state))
+		require.Equal(t, `┌─ fleet
+│  └─ status: (HEALTHY) Connected
+└─ elastic-agent
+   └─ status: (HEALTHY) Running
+`, b.String())
+	})
+
+	t.Run("full", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, humanFullOutput(&b, state))
+		require.Equal(t, `┌─ fleet
+│  └─ status: (HEALTHY) Connected
+├─ elastic-agent
+│  ├─ status: (HEALTHY) Running
+│  └─ info
+│     ├─ id: agent-id
+│     ├─ version: 9.7.0
+│     └─ commit: abc
+└─ cpu_limit
+   ├─ state: disabled
+   ├─ configured: off
+   └─ active_quota: none
+`, b.String())
+	})
+
+	t.Run("json", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, jsonOutput(&b, state))
+		var out struct {
+			CPULimit map[string]any `json:"cpu_limit"`
+		}
+		require.NoError(t, json.Unmarshal(b.Bytes(), &out))
+		require.Equal(t, map[string]any{
+			"state":              "disabled",
+			"configured_percent": float64(0),
+			"effective_cpus":     float64(0),
+			"active_quota":       "none",
+		}, out.CPULimit)
+	})
+
+	t.Run("yaml", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, yamlOutput(&b, state))
+		var out struct {
+			CPULimit map[string]any `yaml:"cpu_limit"`
+		}
+		require.NoError(t, yaml.Unmarshal(b.Bytes(), &out))
+		require.Equal(t, map[string]any{
+			"state":              "disabled",
+			"configured_percent": 0,
+			"effective_cpus":     0,
+			"active_quota":       "none",
+		}, out.CPULimit)
+	})
+}
+
+func TestStatusOutputCPULimitNotReported(t *testing.T) {
+	state := &client.AgentState{State: client.Healthy, Message: "Running", FleetState: client.Healthy, FleetMessage: "Connected"}
+
+	t.Run("json", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, jsonOutput(&b, state))
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(b.Bytes(), &out))
+		require.Contains(t, out, "state")
+		require.NotContains(t, out, "cpu_limit")
+	})
+
+	t.Run("yaml", func(t *testing.T) {
+		var b bytes.Buffer
+		require.NoError(t, yamlOutput(&b, state))
+		var out map[string]any
+		require.NoError(t, yaml.Unmarshal(b.Bytes(), &out))
+		require.Contains(t, out, "state")
+		require.NotContains(t, out, "cpu_limit")
+	})
 }

@@ -150,6 +150,26 @@ type AgentState struct {
 	FleetMessage   string                 `yaml:"fleet_message"`
 	UpgradeDetails *cproto.UpgradeDetails `json:"upgrade_details,omitempty" yaml:"upgrade_details,omitempty"`
 	Collector      *CollectorComponent    `json:"collector,omitempty" yaml:"collector,omitempty"`
+	// CPULimit is nil when the Elastic Agent does not report it.
+	CPULimit *CPULimitState `json:"cpu_limit,omitempty" yaml:"cpu_limit,omitempty"`
+}
+
+// CPULimitState is the state of the CPU cap shared by the Elastic Agent and its components.
+type CPULimitState struct {
+	// State is disabled, pending, applied, unsupported or degraded.
+	State string `json:"state" yaml:"state"`
+	// ConfiguredPercent is the configured cap as a percentage of the host CPU capacity. It is 0 when the cap is off.
+	ConfiguredPercent uint32 `json:"configured_percent" yaml:"configured_percent"`
+	// EffectiveCPUs is the requested number of CPUs after the floor.
+	EffectiveCPUs float64 `json:"effective_cpus" yaml:"effective_cpus"`
+	// ActiveQuota is unknown, none or set.
+	ActiveQuota string `json:"active_quota" yaml:"active_quota"`
+	// ActiveQuotaCPUs is the active quota as a number of CPUs. It has a meaning only when ActiveQuota is set.
+	ActiveQuotaCPUs float64 `json:"active_quota_cpus,omitempty" yaml:"active_quota_cpus,omitempty"`
+	// Error is the unresolved unexpected failure, if any.
+	Error string `json:"error,omitempty" yaml:"error,omitempty"`
+	// Reason tells why enforcement is unavailable on this host.
+	Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
 }
 
 // DiagnosticFileResult is a diagnostic file result.
@@ -629,6 +649,17 @@ func toState(res *cproto.StateResponse) (*AgentState, error) {
 			return nil, err
 		}
 		s.Collector = cs
+	}
+	if res.CpuLimit != nil {
+		s.CPULimit = &CPULimitState{
+			State:             res.CpuLimit.State,
+			ConfiguredPercent: res.CpuLimit.ConfiguredPercent,
+			EffectiveCPUs:     res.CpuLimit.EffectiveCpus,
+			ActiveQuota:       res.CpuLimit.ActiveQuota,
+			ActiveQuotaCPUs:   res.CpuLimit.ActiveQuotaCpus,
+			Error:             res.CpuLimit.Error,
+			Reason:            res.CpuLimit.Reason,
+		}
 	}
 	return s, nil
 }

@@ -24,6 +24,7 @@ import (
 
 	"github.com/jedib0t/go-pretty/v6/list"
 
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/errors"
 	"github.com/elastic/elastic-agent/internal/pkg/cli"
 )
@@ -192,8 +193,46 @@ func listAgentState(l list.Writer, state *client.AgentState, all bool) {
 		l.UnIndent()
 	}
 
+	listCPULimit(l, state.CPULimit, all)
+
 	// Upgrade details
 	listUpgradeDetails(l, state.UpgradeDetails)
+}
+
+func listCPULimit(l list.Writer, s *client.CPULimitState, all bool) {
+	if s == nil {
+		return
+	}
+	// A state this client does not know may come from a newer Elastic Agent, so only the known good states are hidden.
+	state := cpulimit.State(s.State)
+	hidden := state == "" || state == cpulimit.StateDisabled || state == cpulimit.StateApplied
+	if !all && hidden {
+		return
+	}
+
+	l.AppendItem("cpu_limit")
+	l.Indent()
+	l.AppendItem("state: " + s.State)
+	if s.ConfiguredPercent == 0 {
+		l.AppendItem("configured: off")
+	} else {
+		l.AppendItem(fmt.Sprintf("configured: %d%%", s.ConfiguredPercent))
+	}
+	if s.EffectiveCPUs > 0 {
+		l.AppendItem(fmt.Sprintf("effective_cpus: %.2f", s.EffectiveCPUs))
+	}
+	if s.ActiveQuota == string(cpulimit.QuotaSet) {
+		l.AppendItem(fmt.Sprintf("active_quota: %.2f CPUs", s.ActiveQuotaCPUs))
+	} else {
+		l.AppendItem("active_quota: " + cpulimit.QuotaKind(s.ActiveQuota).Name())
+	}
+	if s.Error != "" {
+		l.AppendItem("error: " + s.Error)
+	}
+	if s.Reason != "" {
+		l.AppendItem("reason: " + s.Reason)
+	}
+	l.UnIndent()
 }
 
 func listUpgradeDetails(l list.Writer, upgradeDetails *cproto.UpgradeDetails) {

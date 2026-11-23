@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -21,11 +22,13 @@ import (
 	"github.com/elastic/beats/v7/pkg/logp"
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/coordinator"
+	"github.com/elastic/elastic-agent/internal/pkg/agent/application/cpulimit"
 	"github.com/elastic/elastic-agent/internal/pkg/agent/application/info"
 	"github.com/elastic/elastic-agent/pkg/component"
 	"github.com/elastic/elastic-agent/pkg/component/runtime"
 	"github.com/elastic/elastic-agent/pkg/control"
 	"github.com/elastic/elastic-agent/pkg/control/v2/cproto"
+	"github.com/elastic/elastic-agent/pkg/limits"
 	"github.com/elastic/elastic-agent/pkg/upgrade/details"
 )
 
@@ -291,6 +294,81 @@ func TestStateMapping(t *testing.T) {
 				assert.Equal(t, tc.upgradeDetails.ActionID, stateResponse.UpgradeDetails.ActionId)
 				assert.Equal(t, expectedMetadata, stateResponse.UpgradeDetails.Metadata)
 			}
+		})
+	}
+}
+
+func TestCPULimitToProto(t *testing.T) {
+	var fifty limits.CPULimit
+	require.NoError(t, fifty.Unpack(float64(50)))
+
+	testcases := []struct {
+		name     string
+		snapshot *cpulimit.Snapshot
+		expected *cproto.CPULimit
+	}{
+		{
+			name: "quota set",
+			snapshot: &cpulimit.Snapshot{
+				State:         cpulimit.StateApplied,
+				Configured:    fifty,
+				EffectiveCPUs: 4,
+				ActiveQuota:   cpulimit.Quota{Kind: cpulimit.QuotaSet, CPUs: 2.5},
+			},
+			expected: &cproto.CPULimit{
+				State:             "applied",
+				ConfiguredPercent: 50,
+				EffectiveCpus:     4,
+				ActiveQuota:       "set",
+				ActiveQuotaCpus:   2.5,
+			},
+		},
+		{
+			name: "no quota with error",
+			snapshot: &cpulimit.Snapshot{
+				State:       cpulimit.StateDegraded,
+				Configured:  fifty,
+				ActiveQuota: cpulimit.Quota{Kind: cpulimit.QuotaNone, CPUs: 3},
+				Err:         errors.New("set failed"),
+			},
+			expected: &cproto.CPULimit{
+				State:             "degraded",
+				ConfiguredPercent: 50,
+				ActiveQuota:       "none",
+				Error:             "set failed",
+			},
+		},
+		{
+			name: "unknown quota with reason",
+			snapshot: &cpulimit.Snapshot{
+				State:      cpulimit.StateUnsupported,
+				Configured: fifty,
+				Reason:     "not supported here",
+			},
+			expected: &cproto.CPULimit{
+				State:             "unsupported",
+				ConfiguredPercent: 50,
+				ActiveQuota:       "unknown",
+				Reason:            "not supported here",
+			},
+		},
+		{
+			name:     "zero snapshot",
+			snapshot: &cpulimit.Snapshot{},
+			expected: nil,
+		},
+		{
+			name:     "preview off",
+			snapshot: nil,
+			expected: nil,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			stateResponse, err := stateToProto(&coordinator.State{CPULimit: tc.snapshot}, new(info.AgentInfo))
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, stateResponse.CpuLimit)
 		})
 	}
 }
