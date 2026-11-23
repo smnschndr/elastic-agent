@@ -310,7 +310,7 @@ func newCPULimitController(log *logger.Logger, cfg configuration.InternalCPULimi
 	if !cfg.PreviewEnabled {
 		return nil
 	}
-	return cpulimit.NewController(log.Named("cpu_limit"), cpulimit.NewUnsupportedBackend())
+	return cpulimit.NewController(log.Named("cpu_limit"), cpulimit.NewBackend(paths.ServiceName()))
 }
 
 // normalizeAgentInstalls normalizes agent installs and TTL markers on startup.
